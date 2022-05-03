@@ -1,0 +1,147 @@
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, ggplot2, dplyr, lubridate, readr, readxl,
+               scales, gganimate, cobalt, ivpack, stargazer, haven, ggthemes,
+               acs, tidyr, here,dotwhisker,fixest,MatchIt)
+
+# Read data and set workspace for knitr -------------------------------
+
+heart_2017_data <- read_csv("Downloads/BRFSS__Graph_of_Current_Prevalence_of_Cardiovascular_Disease.csv")
+heart_2012_data <- read_csv("Downloads/Behavioral_Risk_Factor_Surveillance_System__BRFSS__Prevalence_Data__2011_to_present_.csv")
+heart_2013_data <- read_csv("Downloads/Behavioral_Risk_Factor_Surveillance_System__BRFSS__Prevalence_Data__2011_to_present_-2.csv")
+heart_2014_data <- read_csv("Downloads/Behavioral_Risk_Factor_Surveillance_System__BRFSS__Prevalence_Data__2011_to_present_-3.csv")
+heart_2015_data <- read_csv("Downloads/Behavioral_Risk_Factor_Surveillance_System__BRFSS__Prevalence_Data__2011_to_present_-4.csv")
+heart_2016_data <- read_csv("Downloads/Behavioral_Risk_Factor_Surveillance_System__BRFSS__Prevalence_Data__2011_to_present_-5.csv")
+
+heart_2012_data <- heart_2012_data %>% rename(State="Locationdesc") 
+heart_2017_data <- heart_2017_data %>% rename(State="Locationdesc") 
+
+heart_2012_data <- heart_2012_data %>% rename(year="Year") 
+heart_2017_data <- heart_2017_data %>% rename(year="Year")
+
+heart_2013_data <- heart_2013_data %>% rename(State="Locationdesc") %>% rename(year="Year") 
+heart_2014_data <- heart_2014_data %>% rename(State="Locationdesc") %>% rename(year="Year") 
+heart_2015_data <- heart_2015_data %>% rename(State="Locationdesc") %>% rename(year="Year")
+heart_2016_data <- heart_2016_data %>% rename(State="Locationdesc") %>% rename(year="Year")
+
+heart_final_data <- read_csv("Desktop/heart_final_data.csv")
+heart_final_data <- heart_final_data %>% rename(State="Locationdesc") %>% rename(year="Year")
+heart_final_data <- heart_final_data %>% group_by(State,year) %>% arrange(State) %>% 
+  select(year, State, Class, Topic, Question,Response,Sample_Size,Data_value,Confidence_limit_Low,Confidence_limit_High)
+
+
+
+heart_final_data <- rbind(heart_2012_data,heart_2013_data,heart_2014_data,heart_2015_data,heart_2016_data,heart_2017_data) %>%
+  select(year, State, Class, Topic, Question,Response,Sample_Size,Data_value,Confidence_limit_Low,Confidence_limit_High)
+
+final_data <- acs_medicaid_data %>% left_join(heart_final_data)
+
+
+# create plot for heart disease in 2012
+
+final_data <- final_data %>% mutate(perc_heart = Data_value/Sample_Size)
+
+fig_heart <- final_data  %>% ggplot(aes(x=as.factor(year),y=est_pop)) + 
+  stat_summary(fun.y="mean", geom="bar") +
+  labs(
+    x="Year",
+    y="Percent of Population Experiene Heart Attack",
+    title="Proportion of Population Experience Heart Attack"
+  ) + scale_y_continuous(labels=comma) +
+  theme_bw()
+
+final_data <- final_data %>% mutate(est_pop = perc_heart * adult_pop)
+
+
+# plot for distribution of uninsured
+
+unins_data <- acs_medicaid_data %>% filter(!is.na(expand_ever)) %>%
+  group_by(expand_ever, year) %>% summarize(mean=mean(perc_unins))
+
+fig_unins <- ggplot(data=unins_data, aes(x=year,y=mean,group=expand_ever,linetype=expand_ever)) + 
+  geom_line() + geom_point() + theme_bw() +
+  geom_vline(xintercept=2013.5, color="red") +
+  geom_text(data = unins_data %>% filter(year == 2014), 
+            aes(label = c("Non-expansion","Expansion"),
+                x = year + 1,
+                y = mean)) +
+  guides(linetype="none") +
+  labs(
+    x="Year",
+    y="Fraction Uninsured",
+    title="Share of Uninsured over Time")
+    
+
+# Average population who experience heart attack in expand and non-expand states
+
+avg_heart_dat <- final_data %>% group_by(expand_ever) %>% filter(year != 2018) %>%summarize(mean_heart=mean(est_pop))
+
+
+# create indicator variable 
+heart_data_2014 <- final_data %>% filter(year==2014) %>% ungroup() %>%
+  mutate(unins_q1 = quantile(uninsured,probs = 0.25,na.rm = TRUE),
+         unins_q2 = quantile(uninsured,probs = 0.50,na.rm = TRUE),
+         unins_q3 = quantile(uninsured,probs = 0.75,na.rm = TRUE),
+         unins_q4 = max(uninsured,na.rm = TRUE)) %>%
+  mutate(unins1 = ifelse(uninsured<unins_q1,1,0),
+         unins2 = ifelse(uninsured>=unins_q1 & uninsured<unins_q2,1,0),
+         unins3 = ifelse(uninsured>= unins_q2 & uninsured<unins_q3,1,0),
+         unins4 = ifelse(uninsured > unins_q3 & uninsured < unins_q4,1,0))
+
+heart_data_2014 <- heart_data_2014[-c(52),]
+
+
+# 1-to-1 matching
+
+match.inv <- Matching::Match(Y=heart_data_2014$est_pop,
+                             Tr=heart_data_2014$expand_ever,
+                             X= (heart_data_2014 %>% select(unins1,unins2,unins3)),
+                             M=1,
+                             Weight=1,
+                             estimand="ATE")
+
+match.mah <- Matching::Match(Y=heart_data_2014$est_pop,
+                             Tr=heart_data_2014$expand_ever,
+                             X= (heart_data_2014 %>% select(unins1,unins2,unins3)),
+                             M=1,
+                             Weight=2,
+                             estimand="ATE")
+
+
+## Propensity scores and IPW
+
+logit.model <- glm(expand_ever ~ unins1 + unins2 + unins3,
+                   family = binomial,
+                   data = heart_data_2014)
+ps <- fitted(logit.model)
+
+heart_data_2014 <- heart_data_2014 %>% 
+  mutate(ipw = case_when(
+    expand_ever==1 ~ 1/ps,
+    expand_ever==0 ~ 1/(1-ps),
+    TRUE ~ NA_real_
+  ))
+
+mean.t1 <- heart_data_2014 %>% filter(expand_ever==1) %>%
+  select(est_pop,ipw) %>% summarize(mean_p=weighted.mean(est_pop,w=ipw))
+mean.t0 <- heart_data_2014 %>% filter(expand_ever==0) %>%
+  select(est_pop,ipw) %>% summarize(mean_p=weighted.mean(est_pop,w=ipw))
+ipw.diff <- mean.t1$mean_p - mean.t0$mean_p
+
+ipw.reg <- lm(est_pop ~ expand_ever,data = heart_data_2014, weights = ipw)
+
+
+
+## Regression
+reg.data <- heart_data_2014 %>% ungroup() %>%
+  mutate(unins1_diff = expand_ever*(unins1 - mean(unins1)),
+         unins2_diff = expand_ever*(unins2 - mean(unins2)),
+         unins3_diff = expand_ever*(unins3 - mean(unins3)))
+
+reg.heart <- lm(est_pop ~ expand_ever + unins1 + unins2 + unins3 + 
+                  unins1_diff + unins2_diff + unins3_diff,
+                data=reg.data)
+
+
+
+
+
